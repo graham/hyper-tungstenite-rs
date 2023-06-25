@@ -13,7 +13,9 @@
 //! # Example
 //! ```no_run
 //! use futures::{sink::SinkExt, stream::StreamExt};
-//! use hyper::{Body, Request, Response};
+//! use hyper::{Request, Response};
+//! use bytes::Bytes;
+//! use http_body_util::Full;
 //! use hyper_tungstenite::{tungstenite, HyperWebsocket};
 //! use std::convert::Infallible;
 //! use tungstenite::Message;
@@ -21,7 +23,7 @@
 //! type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 //!
 //! /// Handle a HTTP or WebSocket request.
-//! async fn handle_request(mut request: Request<Body>) -> Result<Response<Body>, Error> {
+//! async fn handle_request(mut request: Request<Full<Bytes>>) -> Result<Response<Full<Bytes>>, Error> {
 //!     // Check if the request is a websocket upgrade request.
 //!     if hyper_tungstenite::is_upgrade_request(&request) {
 //!         let (response, websocket) = hyper_tungstenite::upgrade(&mut request, None)?;
@@ -37,7 +39,7 @@
 //!         Ok(response)
 //!     } else {
 //!         // Handle regular HTTP requests here.
-//!         Ok(Response::new(Body::from("Hello HTTP!")))
+//!         Ok(Response::new(Full::new(Bytes::from("Hello HTTP!"))))
 //!     }
 //! }
 //!
@@ -103,14 +105,16 @@
 //! }
 //! ```
 
-use hyper::{Body, Request, Response};
-use std::task::{Context, Poll};
-use std::pin::Pin;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{Request, Response};
 use pin_project::pin_project;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use tungstenite::{Error, error::ProtocolError};
 use tungstenite::handshake::derive_accept_key;
 use tungstenite::protocol::{Role, WebSocketConfig};
+use tungstenite::{error::ProtocolError, Error};
 
 pub use hyper;
 pub use tungstenite;
@@ -121,9 +125,9 @@ pub use tokio_tungstenite::WebSocketStream;
 #[pin_project]
 #[derive(Debug)]
 pub struct HyperWebsocket {
-	#[pin]
-	inner: hyper::upgrade::OnUpgrade,
-	config: Option<WebSocketConfig>,
+    #[pin]
+    inner: hyper::upgrade::OnUpgrade,
+    config: Option<WebSocketConfig>,
 }
 
 /// Try to upgrade a received `hyper::Request` to a websocket connection.
@@ -141,31 +145,38 @@ pub struct HyperWebsocket {
 /// Alternatively you can inspect the `Connection` and `Upgrade` headers manually.
 ///
 pub fn upgrade<B>(
-	mut request: impl std::borrow::BorrowMut<Request<B>>,
-	config: Option<WebSocketConfig>,
-) -> Result<(Response<Body>, HyperWebsocket), ProtocolError> {
-	let request = request.borrow_mut();
+    mut request: impl std::borrow::BorrowMut<Request<B>>,
+    config: Option<WebSocketConfig>,
+) -> Result<(Response<Full<Bytes>>, HyperWebsocket), ProtocolError> {
+    let request = request.borrow_mut();
 
-	let key = request.headers().get("Sec-WebSocket-Key")
-		.ok_or(ProtocolError::MissingSecWebSocketKey)?;
-	if request.headers().get("Sec-WebSocket-Version").map(|v| v.as_bytes()) != Some(b"13") {
-		return Err(ProtocolError::MissingSecWebSocketVersionHeader);
-	}
+    let key = request
+        .headers()
+        .get("Sec-WebSocket-Key")
+        .ok_or(ProtocolError::MissingSecWebSocketKey)?;
+    if request
+        .headers()
+        .get("Sec-WebSocket-Version")
+        .map(|v| v.as_bytes())
+        != Some(b"13")
+    {
+        return Err(ProtocolError::MissingSecWebSocketVersionHeader);
+    }
 
-	let response = Response::builder()
-		.status(hyper::StatusCode::SWITCHING_PROTOCOLS)
-		.header(hyper::header::CONNECTION, "upgrade")
-		.header(hyper::header::UPGRADE, "websocket")
-		.header("Sec-WebSocket-Accept", &derive_accept_key(key.as_bytes()))
-		.body(Body::from("switching to websocket protocol"))
-		.expect("bug: failed to build response");
+    let response = Response::builder()
+        .status(hyper::StatusCode::SWITCHING_PROTOCOLS)
+        .header(hyper::header::CONNECTION, "upgrade")
+        .header(hyper::header::UPGRADE, "websocket")
+        .header("Sec-WebSocket-Accept", &derive_accept_key(key.as_bytes()))
+        .body(Full::new(Bytes::from("switching to websocket protocol")))
+        .expect("bug: failed to build response");
 
-	let stream = HyperWebsocket {
-		inner: hyper::upgrade::on(request),
-		config,
-	};
+    let stream = HyperWebsocket {
+        inner: hyper::upgrade::on(request),
+        config,
+    };
 
-	Ok((response, stream))
+    Ok((response, stream))
 }
 
 /// Check if a request is a websocket upgrade request.
@@ -175,65 +186,69 @@ pub fn upgrade<B>(
 /// If the server supports multiple upgrade protocols,
 /// it would be more appropriate to try each listed protocol in order.
 pub fn is_upgrade_request<B>(request: &hyper::Request<B>) -> bool {
-	header_contains_value(request.headers(), hyper::header::CONNECTION, "Upgrade")
-		&& header_contains_value(request.headers(), hyper::header::UPGRADE, "websocket")
+    header_contains_value(request.headers(), hyper::header::CONNECTION, "Upgrade")
+        && header_contains_value(request.headers(), hyper::header::UPGRADE, "websocket")
 }
 
 /// Check if there is a header of the given name containing the wanted value.
-fn header_contains_value(headers: &hyper::HeaderMap, header: impl hyper::header::AsHeaderName, value: impl AsRef<[u8]>) -> bool {
-	let value = value.as_ref();
-	for header in headers.get_all(header) {
-		if header.as_bytes().split(|&c| c == b',').any(|x| trim(x).eq_ignore_ascii_case(value)) {
-			return true;
-		}
-	}
-	false
+fn header_contains_value(
+    headers: &hyper::HeaderMap,
+    header: impl hyper::header::AsHeaderName,
+    value: impl AsRef<[u8]>,
+) -> bool {
+    let value = value.as_ref();
+    for header in headers.get_all(header) {
+        if header
+            .as_bytes()
+            .split(|&c| c == b',')
+            .any(|x| trim(x).eq_ignore_ascii_case(value))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn trim(data: &[u8]) -> &[u8] {
-	trim_end(trim_start(data))
+    trim_end(trim_start(data))
 }
 
 fn trim_start(data: &[u8]) -> &[u8] {
-	if let Some(start) =data.iter().position(|x| !x.is_ascii_whitespace()) {
-		&data[start..]
-	} else {
-		b""
-	}
+    if let Some(start) = data.iter().position(|x| !x.is_ascii_whitespace()) {
+        &data[start..]
+    } else {
+        b""
+    }
 }
 
 fn trim_end(data: &[u8]) -> &[u8] {
-	if let Some(last) = data.iter().rposition(|x| !x.is_ascii_whitespace()) {
-		&data[..last + 1]
-	} else {
-		b""
-	}
+    if let Some(last) = data.iter().rposition(|x| !x.is_ascii_whitespace()) {
+        &data[..last + 1]
+    } else {
+        b""
+    }
 }
 
 impl std::future::Future for HyperWebsocket {
-	type Output = Result<WebSocketStream<hyper::upgrade::Upgraded>, Error>;
+    type Output = Result<WebSocketStream<hyper::upgrade::Upgraded>, Error>;
 
-	fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-		let this = self.project();
-		let upgraded = match this.inner.poll(cx) {
-			Poll::Pending => return Poll::Pending,
-			Poll::Ready(x) => x,
-		};
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = self.project();
+        let upgraded = match this.inner.poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(x) => x,
+        };
 
-		let upgraded = upgraded.map_err(|_| Error::Protocol(ProtocolError::HandshakeIncomplete))?;
+        let upgraded = upgraded.map_err(|_| Error::Protocol(ProtocolError::HandshakeIncomplete))?;
 
-		let stream = WebSocketStream::from_raw_socket(
-			upgraded,
-			Role::Server,
-			this.config.take(),
-		);
-		tokio::pin!(stream);
+        let stream = WebSocketStream::from_raw_socket(upgraded, Role::Server, this.config.take());
+        tokio::pin!(stream);
 
-		// The future returned by `from_raw_socket` is always ready.
-		// Not sure why it is a future in the first place.
-		match stream.as_mut().poll(cx) {
-			Poll::Pending => unreachable!("from_raw_socket should always be created ready"),
-			Poll::Ready(x) => Poll::Ready(Ok(x)),
-		}
-	}
+        // The future returned by `from_raw_socket` is always ready.
+        // Not sure why it is a future in the first place.
+        match stream.as_mut().poll(cx) {
+            Poll::Pending => unreachable!("from_raw_socket should always be created ready"),
+            Poll::Ready(x) => Poll::Ready(Ok(x)),
+        }
+    }
 }
